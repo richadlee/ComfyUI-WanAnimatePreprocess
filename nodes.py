@@ -5,6 +5,7 @@ import numpy as np
 import folder_paths
 import cv2
 import json
+import logging
 script_directory = os.path.dirname(os.path.abspath(__file__))
 
 from comfy import model_management as mm
@@ -67,8 +68,8 @@ class PoseAndFaceDetection:
             },
         }
 
-    RETURN_TYPES = ("POSEDATA", "IMAGE", "STRING", "BBOX", )
-    RETURN_NAMES = ("pose_data", "face_images", "key_frame_body_points", "bboxes", )
+    RETURN_TYPES = ("POSEDATA", "IMAGE", "STRING", "BBOX", "BBOX,")
+    RETURN_NAMES = ("pose_data", "face_images", "key_frame_body_points", "bboxes", "face_bboxes")
     FUNCTION = "process"
     CATEGORY = "WanAnimatePreprocess"
     DESCRIPTION = "Detects human poses and face images from input images. Optionally retargets poses based on a reference image."
@@ -145,11 +146,26 @@ class PoseAndFaceDetection:
         pose_metas = load_pose_metas_from_kp2ds_seq(kp2ds, width=W, height=H)
 
         face_images = []
+        face_bboxes = []
         for idx, meta in enumerate(pose_metas):
             face_bbox_for_image = get_face_bboxes(meta['keypoints_face'][:, :2], scale=1.3, image_shape=(H, W))
-
             x1, x2, y1, y2 = face_bbox_for_image
+            face_bboxes.append((x1, y1, x2, y2))
             face_image = images_np[idx][y1:y2, x1:x2]
+            # Check if face_image is valid before resizing
+            if face_image.size == 0 or face_image.shape[0] == 0 or face_image.shape[1] == 0:
+                logging.warning(f"Empty face crop on frame {idx}, creating fallback image.")
+                # Create a fallback image (black or use center crop)
+                fallback_size = int(min(H, W) * 0.3)
+                fallback_x1 = (W - fallback_size) // 2
+                fallback_x2 = fallback_x1 + fallback_size
+                fallback_y1 = int(H * 0.1)
+                fallback_y2 = fallback_y1 + fallback_size
+                face_image = images_np[idx][fallback_y1:fallback_y2, fallback_x1:fallback_x2]
+                
+                # If still empty, create a black image
+                if face_image.size == 0:
+                    face_image = np.zeros((fallback_size, fallback_size, C), dtype=images_np.dtype)
             face_image = cv2.resize(face_image, (512, 512))
             face_images.append(face_image)
 
@@ -196,7 +212,7 @@ class PoseAndFaceDetection:
             "pose_metas_original": pose_metas,
         }
 
-        return (pose_data, face_images_tensor, json.dumps(points_dict_list), [bbox_ints],)
+        return (pose_data, face_images_tensor, json.dumps(points_dict_list), [bbox_ints], face_bboxes)
 
 class DrawViTPose:
     @classmethod
