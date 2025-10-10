@@ -17,7 +17,7 @@ folder_paths.add_model_folder_path("detection", os.path.join(folder_paths.models
 from .models.onnx_models import ViTPose, Yolo
 from .pose_utils.pose2d_utils import load_pose_metas_from_kp2ds_seq, crop, bbox_from_detector
 from .utils import get_face_bboxes, padding_resize, resize_by_area, resize_to_bounds
-from .pose_utils.human_visualization import AAPoseMeta, draw_aapose_by_meta_new, draw_aaface_by_meta
+from .pose_utils.human_visualization import AAPoseMeta, draw_aapose_by_meta_new, draw_aaface_by_meta, draw_hand_by_meta
 from .retarget_pose import get_retarget_pose
 
 class OnnxDetectionModelLoader:
@@ -317,15 +317,96 @@ class PoseRetargetPromptHelper:
 
         return (tpl_prompt, refer_prompt, )
 
+class PoseMaskFromData:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "pose_data": ("POSEDATA",),
+                "width": ("INT", {"default": 832, "min": 64, "max": 2048, "step": 1, "tooltip": "Width of the generation"}),
+                "height": ("INT", {"default": 480, "min": 64, "max": 2048, "step": 1, "tooltip": "Height of the generation"}),
+                "draw_face": ("BOOLEAN", {"default": "False", "tooltip": "Whether to draw face keypoints"}),
+                "draw_body": ("BOOLEAN", {"default": "True", "tooltip": "Whether to draw body keypoints"}),
+                "draw_hand": ("BOOLEAN", {"default": "False", "tooltip": "Whether to draw hand keypoints"}),
+                "mask_offset_x": ("INT", {"default": 0, "min": -2048, "max": 2048, "step": 1, "tooltip": "Horizontal shift of the mask. +right, -left"}),
+                "mask_offset_y": ("INT", {"default": 0, "min": -2048, "max": 2048, "step": 1, "tooltip": "Vertical shift of the mask. +down, -up"}),
+            },
+        }
+
+    RETURN_TYPES = ("MASK", )
+    RETURN_NAMES = ("mask", )
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess"
+    DESCRIPTION = "Generates per-frame binary masks from pose_data by drawing selected parts (face/body/hands)."
+
+    def process(self, pose_data, width, height, draw_face, draw_body, draw_hand, mask_offset_x=0, mask_offset_y=0):
+        pose_metas = pose_data["pose_metas"]
+
+        canvas_template = np.zeros((height, width, 3), dtype=np.uint8)
+        masks = []
+
+        for meta in tqdm(pose_metas, desc="Drawing pose masks"):
+            img = np.zeros_like(canvas_template)
+            if draw_body:
+                img = draw_aapose_by_meta_new(
+                    img,
+                    meta,
+                    draw_hand=bool(draw_hand),
+                    draw_head=bool(draw_face),
+                    body_stick_width=-1,
+                    hand_stick_width=-1,
+                )
+            else:
+                if draw_hand:
+                    img = draw_hand_by_meta(img, meta, threshold=0.5, stick_width_norm=200)
+                # Draw face by bbox rectangle like in PoseAndFaceDetection
+                if draw_face and getattr(meta, 'kps_face', None) is not None and meta.kps_face is not None and len(meta.kps_face) > 0:
+                    kp2ds_face_norm = meta.kps_face / np.array([meta.width, meta.height], dtype=np.float32)
+                    x1, x2, y1, y2 = get_face_bboxes(kp2ds_face_norm, scale=1.3, image_shape=(height, width))
+                    cv2.rectangle(img, (int(x1), int(y1)), (int(x2), int(y2)), (255, 255, 255), thickness=-1)
+
+            # If body branch drew, optionally also overlay face bbox when requested
+            if draw_body and draw_face and getattr(meta, 'kps_face', None) is not None and meta.kps_face is not None and len(meta.kps_face) > 0:
+                kp2ds_face_norm = meta.kps_face / np.array([meta.width, meta.height], dtype=np.float32)
+                x1, x2, y1, y2 = get_face_bboxes(kp2ds_face_norm, scale=1.3, image_shape=(height, width))
+                cv2.rectangle(img, (int(x1), int(y1)), (int(x2), int(y2)), (255, 255, 255), thickness=-1)
+
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            _, bin_mask = cv2.threshold(gray, 1, 255, cv2.THRESH_BINARY)
+
+            # apply translation offsets to the binary mask
+            if mask_offset_x != 0 or mask_offset_y != 0:
+                translation_matrix = np.float32([[1, 0, float(mask_offset_x)], [0, 1, float(mask_offset_y)]])
+                bin_mask = cv2.warpAffine(
+                    bin_mask,
+                    translation_matrix,
+                    (width, height),
+                    flags=cv2.INTER_NEAREST,
+                    borderMode=cv2.BORDER_CONSTANT,
+                    borderValue=0,
+                )
+
+            mask_float = (bin_mask.astype(np.float32) / 255.0)
+            masks.append(mask_float)
+
+        if len(masks) == 0:
+            masks.append(np.zeros((height, width), dtype=np.float32))
+
+        mask_batch = np.stack(masks, 0)  # [B, H, W]
+        mask_tensor = torch.from_numpy(mask_batch)
+        return (mask_tensor, )
+
 NODE_CLASS_MAPPINGS = {
     "OnnxDetectionModelLoader": OnnxDetectionModelLoader,
     "PoseAndFaceDetection": PoseAndFaceDetection,
     "DrawViTPose": DrawViTPose,
     "PoseRetargetPromptHelper": PoseRetargetPromptHelper,
+    "PoseMaskFromData": PoseMaskFromData,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "OnnxDetectionModelLoader": "ONNX Detection Model Loader",
     "PoseAndFaceDetection": "Pose and Face Detection",
     "DrawViTPose": "Draw ViT Pose",
     "PoseRetargetPromptHelper": "Pose Retarget Prompt Helper",
+    "PoseMaskFromData": "Pose Mask From Data",
 }
