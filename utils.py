@@ -299,6 +299,12 @@ def get_face_bboxes(kp2ds, scale, image_shape):
     initial_width = max_x - min_x
     initial_height = max_y - min_y
 
+    if initial_width < 1 or initial_height < 1:
+        cx, cy = (min_x + max_x) / 2, (min_y + max_y) / 2
+        fallback_size = max(initial_width, initial_height, min(h, w) * 0.1)
+        return [int(max(cx - fallback_size, 0)), int(min(cx + fallback_size, w)),
+                int(max(cy - fallback_size, 0)), int(min(cy + fallback_size, h))]
+
     initial_area = initial_width * initial_height
 
     expanded_area = initial_area * scale
